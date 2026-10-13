@@ -1,266 +1,226 @@
-"""طبقة قاعدة البيانات (SQLite) لتطبيق التواصل الاجتماعي."""
+"""طبقة قاعدة البيانات (Supabase) لتطبيق التواصل الاجتماعي.
 
-import hashlib
-import hmac
+كل جلسة متصفح تنشئ كائن Database خاصاً بها، فيبقى تسجيل الدخول منفصلاً لكل مستخدم.
+الصلاحيات تُفرض في قاعدة البيانات نفسها عبر Row Level Security (انظر supabase/schema.sql).
+"""
+
 import os
-import sqlite3
-from datetime import datetime
+import re
 
-DEFAULT_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "social.db")
+from postgrest.exceptions import APIError
+from supabase import create_client
+from supabase_auth.errors import AuthError
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS users (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    username      TEXT    NOT NULL UNIQUE COLLATE NOCASE,
-    full_name     TEXT    NOT NULL,
-    bio           TEXT    NOT NULL DEFAULT '',
-    password_hash TEXT    NOT NULL,
-    salt          TEXT    NOT NULL,
-    created_at    TEXT    NOT NULL
-);
+try:
+    from dotenv import load_dotenv
 
-CREATE TABLE IF NOT EXISTS posts (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    content    TEXT    NOT NULL,
-    created_at TEXT    NOT NULL
-);
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except ImportError:
+    pass
 
-CREATE TABLE IF NOT EXISTS likes (
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
-    PRIMARY KEY (user_id, post_id)
-);
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,30}$")
 
-CREATE TABLE IF NOT EXISTS comments (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    post_id    INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
-    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    content    TEXT    NOT NULL,
-    created_at TEXT    NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS follows (
-    follower_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    followed_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    PRIMARY KEY (follower_id, followed_id),
-    CHECK (follower_id <> followed_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_posts_user ON posts(user_id);
-CREATE INDEX IF NOT EXISTS idx_comments_post ON comments(post_id);
-"""
-
-POST_SELECT = """
-SELECT p.id, p.user_id, p.content, p.created_at,
-       u.username, u.full_name,
-       (SELECT COUNT(*) FROM likes l WHERE l.post_id = p.id)    AS like_count,
-       (SELECT COUNT(*) FROM comments c WHERE c.post_id = p.id) AS comment_count,
-       EXISTS(SELECT 1 FROM likes l WHERE l.post_id = p.id AND l.user_id = ?) AS liked
-FROM posts p
-JOIN users u ON u.id = p.user_id
-"""
+AUTH_ERRORS = {
+    "invalid_credentials": "البريد الإلكتروني أو كلمة المرور غير صحيحة",
+    "user_already_exists": "هذا البريد الإلكتروني مسجّل مسبقاً",
+    "email_exists": "هذا البريد الإلكتروني مسجّل مسبقاً",
+    "email_not_confirmed": "لم يتم تفعيل البريد الإلكتروني بعد، تحقق من بريدك",
+    "weak_password": "كلمة المرور ضعيفة، اختر كلمة أقوى",
+    "validation_failed": "البريد الإلكتروني غير صالح",
+    "email_address_invalid": "البريد الإلكتروني غير صالح",
+    "over_request_rate_limit": "محاولات كثيرة، حاول مرة أخرى بعد قليل",
+    "over_email_send_rate_limit": "محاولات كثيرة، حاول مرة أخرى بعد قليل",
+}
 
 
 class DatabaseError(Exception):
     """خطأ برسالة مفهومة للمستخدم."""
 
 
-def _now():
-    return datetime.now().isoformat(timespec="seconds")
+class ConfirmEmail(Exception):
+    """تم إنشاء الحساب لكن يجب تفعيل البريد الإلكتروني قبل تسجيل الدخول."""
 
 
-def _hash_password(password, salt):
-    return hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), 200_000).hex()
+def _auth_error(err):
+    return DatabaseError(AUTH_ERRORS.get(getattr(err, "code", None), f"خطأ في المصادقة: {err}"))
+
+
+def _api_error(err):
+    return DatabaseError(f"خطأ في قاعدة البيانات: {err.message or err}")
 
 
 class Database:
-    def __init__(self, path=DEFAULT_DB_PATH):
-        self.conn = sqlite3.connect(path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA foreign_keys = ON")
-        self.conn.executescript(SCHEMA)
-        self.conn.commit()
+    def __init__(self, url=None, key=None):
+        url = url or os.environ.get("SUPABASE_URL")
+        key = key or os.environ.get("SUPABASE_KEY")
+        if not url or not key:
+            raise RuntimeError(
+                "يجب تعيين SUPABASE_URL و SUPABASE_KEY (في ملف .env أو متغيرات البيئة)"
+            )
+        self.client = create_client(url, key)
+        self.user_id = None
 
     def close(self):
-        self.conn.close()
+        try:
+            self.client.auth.sign_out()
+        except AuthError:
+            pass
 
-    # ---------- المستخدمون ----------
+    def _rpc(self, name, params):
+        try:
+            return self.client.rpc(name, params).execute().data
+        except APIError as err:
+            raise _api_error(err) from None
 
-    def register(self, username, full_name, password):
-        username = username.strip()
-        full_name = full_name.strip()
-        if len(username) < 3 or not username.replace("_", "").isalnum():
-            raise DatabaseError("اسم المستخدم يجب أن يكون 3 أحرف على الأقل (حروف وأرقام و _ فقط)")
+    def _run(self, query):
+        try:
+            return query.execute().data
+        except APIError as err:
+            raise _api_error(err) from None
+
+    # ---------- الحسابات ----------
+
+    def register(self, email, username, full_name, password):
+        """ينشئ حساباً ويسجّل الدخول. يرفع ConfirmEmail إذا كان تفعيل البريد مطلوباً."""
+        email, username, full_name = email.strip(), username.strip(), full_name.strip()
+        if not email:
+            raise DatabaseError("الرجاء إدخال البريد الإلكتروني")
+        if not USERNAME_RE.match(username):
+            raise DatabaseError("اسم المستخدم يجب أن يكون 3 إلى 30 حرفاً (حروف إنجليزية وأرقام و _ فقط)")
         if not full_name:
             raise DatabaseError("الرجاء إدخال الاسم الكامل")
         if len(password) < 6:
             raise DatabaseError("كلمة المرور يجب أن تكون 6 أحرف على الأقل")
-        salt = os.urandom(16).hex()
+        if not self._rpc("username_available", {"p_username": username}):
+            raise DatabaseError("اسم المستخدم مستخدم مسبقاً")
         try:
-            cur = self.conn.execute(
-                "INSERT INTO users (username, full_name, password_hash, salt, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (username, full_name, _hash_password(password, salt), salt, _now()),
+            res = self.client.auth.sign_up(
+                {
+                    "email": email,
+                    "password": password,
+                    "options": {"data": {"username": username, "full_name": full_name}},
+                }
             )
-        except sqlite3.IntegrityError:
-            raise DatabaseError("اسم المستخدم مستخدم مسبقاً") from None
-        self.conn.commit()
-        return self.get_user(cur.lastrowid)
+        except AuthError as err:
+            raise _auth_error(err) from None
+        if res.session is None:
+            raise ConfirmEmail()
+        self.user_id = res.user.id
+        return self.get_user(self.user_id)
 
-    def login(self, username, password):
-        row = self.conn.execute(
-            "SELECT * FROM users WHERE username = ?", (username.strip(),)
-        ).fetchone()
-        if row is None or not hmac.compare_digest(
-            row["password_hash"], _hash_password(password, row["salt"])
-        ):
-            raise DatabaseError("اسم المستخدم أو كلمة المرور غير صحيحة")
-        return self.get_user(row["id"])
+    def login(self, email, password):
+        try:
+            res = self.client.auth.sign_in_with_password(
+                {"email": email.strip(), "password": password}
+            )
+        except AuthError as err:
+            raise _auth_error(err) from None
+        self.user_id = res.user.id
+        return self.get_user(self.user_id)
+
+    def logout(self):
+        self.close()
+        self.user_id = None
+
+    # ---------- الملفات الشخصية ----------
 
     def get_user(self, user_id):
-        row = self.conn.execute(
-            """
-            SELECT id, username, full_name, bio, created_at,
-                   (SELECT COUNT(*) FROM posts   WHERE user_id = u.id)     AS post_count,
-                   (SELECT COUNT(*) FROM follows WHERE followed_id = u.id) AS followers,
-                   (SELECT COUNT(*) FROM follows WHERE follower_id = u.id) AS following
-            FROM users u WHERE id = ?
-            """,
-            (user_id,),
-        ).fetchone()
-        return dict(row) if row else None
+        rows = self._rpc("get_profile", {"p_user_id": user_id})
+        return rows[0] if rows else None
 
-    def update_profile(self, user_id, full_name, bio):
+    def update_profile(self, full_name, bio):
         full_name = full_name.strip()
         if not full_name:
             raise DatabaseError("الاسم الكامل لا يمكن أن يكون فارغاً")
-        self.conn.execute(
-            "UPDATE users SET full_name = ?, bio = ? WHERE id = ?",
-            (full_name, bio.strip(), user_id),
+        self._run(
+            self.client.table("profiles")
+            .update({"full_name": full_name, "bio": bio.strip()})
+            .eq("id", self.user_id)
         )
-        self.conn.commit()
 
     def search_users(self, query, limit=30):
-        like = f"%{query.strip()}%"
-        rows = self.conn.execute(
-            "SELECT id, username, full_name, bio FROM users "
-            "WHERE username LIKE ? OR full_name LIKE ? ORDER BY username LIMIT ?",
-            (like, like, limit),
-        ).fetchall()
-        return [dict(r) for r in rows]
+        # إزالة المحارف الخاصة بصيغة فلاتر PostgREST
+        q = re.sub(r"[,()*%\\]", " ", query).strip()
+        if not q:
+            return []
+        return self._run(
+            self.client.table("profiles")
+            .select("id, username, full_name, bio")
+            .or_(f"username.ilike.*{q}*,full_name.ilike.*{q}*")
+            .order("username")
+            .limit(limit)
+        )
 
     # ---------- المتابعة ----------
 
-    def is_following(self, follower_id, followed_id):
-        return (
-            self.conn.execute(
-                "SELECT 1 FROM follows WHERE follower_id = ? AND followed_id = ?",
-                (follower_id, followed_id),
-            ).fetchone()
-            is not None
-        )
-
-    def toggle_follow(self, follower_id, followed_id):
+    def toggle_follow(self, followed_id):
         """يتابع أو يلغي المتابعة. يعيد True إذا أصبح متابعاً."""
-        if follower_id == followed_id:
+        if followed_id == self.user_id:
             raise DatabaseError("لا يمكنك متابعة نفسك")
-        if self.is_following(follower_id, followed_id):
-            self.conn.execute(
-                "DELETE FROM follows WHERE follower_id = ? AND followed_id = ?",
-                (follower_id, followed_id),
-            )
-            result = False
-        else:
-            self.conn.execute(
-                "INSERT INTO follows (follower_id, followed_id) VALUES (?, ?)",
-                (follower_id, followed_id),
-            )
-            result = True
-        self.conn.commit()
-        return result
+        removed = self._run(
+            self.client.table("follows")
+            .delete()
+            .eq("follower_id", self.user_id)
+            .eq("followed_id", followed_id)
+        )
+        if removed:
+            return False
+        self._run(self.client.table("follows").insert({"followed_id": followed_id}))
+        return True
 
     # ---------- المنشورات ----------
 
-    def create_post(self, user_id, content):
+    def create_post(self, content):
         content = content.strip()
         if not content:
             raise DatabaseError("لا يمكن نشر منشور فارغ")
         if len(content) > 1000:
             raise DatabaseError("المنشور طويل جداً (الحد الأقصى 1000 حرف)")
-        cur = self.conn.execute(
-            "INSERT INTO posts (user_id, content, created_at) VALUES (?, ?, ?)",
-            (user_id, content, _now()),
-        )
-        self.conn.commit()
-        return cur.lastrowid
+        return self._run(self.client.table("posts").insert({"content": content}))[0]["id"]
 
-    def delete_post(self, user_id, post_id):
-        cur = self.conn.execute(
-            "DELETE FROM posts WHERE id = ? AND user_id = ?", (post_id, user_id)
-        )
-        self.conn.commit()
-        return cur.rowcount > 0
+    def delete_post(self, post_id):
+        """RLS يضمن أن المستخدم لا يحذف إلا منشوراته."""
+        return bool(self._run(self.client.table("posts").delete().eq("id", post_id)))
 
-    def feed(self, user_id, limit=100):
-        """منشورات المستخدم ومن يتابعهم."""
-        rows = self.conn.execute(
-            POST_SELECT
-            + """
-            WHERE p.user_id = ?
-               OR p.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)
-            ORDER BY p.id DESC LIMIT ?
-            """,
-            (user_id, user_id, user_id, limit),
-        ).fetchall()
-        return [dict(r) for r in rows]
+    def feed(self, limit=100):
+        """منشوراتي ومنشورات من أتابعهم."""
+        return self._rpc("get_posts", {"p_mode": "feed", "p_limit": limit})
 
-    def all_posts(self, viewer_id, limit=100):
-        rows = self.conn.execute(
-            POST_SELECT + " ORDER BY p.id DESC LIMIT ?", (viewer_id, limit)
-        ).fetchall()
-        return [dict(r) for r in rows]
+    def all_posts(self, limit=100):
+        return self._rpc("get_posts", {"p_mode": "all", "p_limit": limit})
 
-    def user_posts(self, viewer_id, user_id, limit=100):
-        rows = self.conn.execute(
-            POST_SELECT + " WHERE p.user_id = ? ORDER BY p.id DESC LIMIT ?",
-            (viewer_id, user_id, limit),
-        ).fetchall()
-        return [dict(r) for r in rows]
+    def user_posts(self, user_id, limit=100):
+        return self._rpc("get_posts", {"p_mode": "user", "p_user_id": user_id, "p_limit": limit})
 
     # ---------- الإعجابات والتعليقات ----------
 
-    def toggle_like(self, user_id, post_id):
+    def toggle_like(self, post_id):
         """يعيد True إذا أصبح المنشور معجباً به."""
-        cur = self.conn.execute(
-            "DELETE FROM likes WHERE user_id = ? AND post_id = ?", (user_id, post_id)
+        removed = self._run(
+            self.client.table("likes").delete().eq("user_id", self.user_id).eq("post_id", post_id)
         )
-        liked = cur.rowcount == 0
-        if liked:
-            self.conn.execute(
-                "INSERT INTO likes (user_id, post_id) VALUES (?, ?)", (user_id, post_id)
-            )
-        self.conn.commit()
-        return liked
+        if removed:
+            return False
+        self._run(self.client.table("likes").insert({"post_id": post_id}))
+        return True
 
-    def add_comment(self, user_id, post_id, content):
+    def add_comment(self, post_id, content):
         content = content.strip()
         if not content:
             raise DatabaseError("لا يمكن إضافة تعليق فارغ")
-        cur = self.conn.execute(
-            "INSERT INTO comments (post_id, user_id, content, created_at) VALUES (?, ?, ?, ?)",
-            (post_id, user_id, content, _now()),
-        )
-        self.conn.commit()
-        return cur.lastrowid
+        if len(content) > 500:
+            raise DatabaseError("التعليق طويل جداً (الحد الأقصى 500 حرف)")
+        return self._run(
+            self.client.table("comments").insert({"post_id": post_id, "content": content})
+        )[0]["id"]
 
     def get_comments(self, post_id):
-        rows = self.conn.execute(
-            """
-            SELECT c.id, c.content, c.created_at, c.user_id, u.username, u.full_name
-            FROM comments c JOIN users u ON u.id = c.user_id
-            WHERE c.post_id = ? ORDER BY c.id
-            """,
-            (post_id,),
-        ).fetchall()
-        return [dict(r) for r in rows]
+        rows = self._run(
+            self.client.table("comments")
+            .select("id, content, created_at, user_id, profiles(username, full_name)")
+            .eq("post_id", post_id)
+            .order("id")
+        )
+        return [
+            {**{k: v for k, v in r.items() if k != "profiles"}, **r["profiles"]} for r in rows
+        ]

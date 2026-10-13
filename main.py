@@ -1,15 +1,15 @@
-"""تواصل - موقع تواصل اجتماعي مبني بـ Python Flet و SQLite.
+"""تواصل - موقع تواصل اجتماعي مبني بـ Python Flet و Supabase.
 
-التشغيل:
+التشغيل (بعد إعداد ملف .env، انظر README.md):
     python main.py            # يفتح الموقع في المتصفح على http://localhost:8550
 """
 
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 import flet as ft
 
-from database import DEFAULT_DB_PATH, Database, DatabaseError
+from database import ConfirmEmail, Database, DatabaseError
 
 APP_NAME = "تواصل"
 AVATAR_COLORS = [
@@ -22,13 +22,13 @@ def avatar(user_id, name, radius=20):
     """صورة رمزية بالحرف الأول من الاسم ولون ثابت لكل مستخدم."""
     return ft.CircleAvatar(
         content=ft.Text(name[:1].upper(), weight=ft.FontWeight.BOLD, color=ft.Colors.WHITE),
-        bgcolor=AVATAR_COLORS[user_id % len(AVATAR_COLORS)],
+        bgcolor=AVATAR_COLORS[int(user_id[:8], 16) % len(AVATAR_COLORS)],
         radius=radius,
     )
 
 
 def time_ago(iso):
-    seconds = int((datetime.now() - datetime.fromisoformat(iso)).total_seconds())
+    seconds = int((datetime.now(timezone.utc) - datetime.fromisoformat(iso)).total_seconds())
     if seconds < 60:
         return "الآن"
     if seconds < 3600:
@@ -43,8 +43,8 @@ def time_ago(iso):
 class SocialApp:
     def __init__(self, page: ft.Page):
         self.page = page
-        # اتصال مستقل لكل جلسة متصفح
-        self.db = Database(os.environ.get("SOCIAL_DB", DEFAULT_DB_PATH))
+        # عميل Supabase مستقل لكل جلسة متصفح
+        self.db = Database()
         self.user = None
         self.tab = 0
         self.profile_user_id = None
@@ -89,7 +89,11 @@ class SocialApp:
         self.page.appbar = None
         self.page.navigation_bar = None
 
-        username = ft.TextField(label="اسم المستخدم", prefix_icon=ft.Icons.PERSON, autofocus=True)
+        email = ft.TextField(
+            label="البريد الإلكتروني", prefix_icon=ft.Icons.EMAIL, autofocus=True,
+            keyboard_type=ft.KeyboardType.EMAIL, rtl=False,
+        )
+        username = ft.TextField(label="اسم المستخدم", prefix_icon=ft.Icons.PERSON, visible=register)
         full_name = ft.TextField(label="الاسم الكامل", prefix_icon=ft.Icons.BADGE, visible=register)
         password = ft.TextField(
             label="كلمة المرور", prefix_icon=ft.Icons.LOCK, password=True, can_reveal_password=True
@@ -98,11 +102,16 @@ class SocialApp:
         def submit(e):
             try:
                 if register:
-                    self.user = self.db.register(username.value, full_name.value, password.value)
+                    self.user = self.db.register(
+                        email.value or "", username.value or "", full_name.value or "", password.value or ""
+                    )
                     self.toast(f"أهلاً بك يا {self.user['full_name']}!")
                 else:
-                    self.user = self.db.login(username.value, password.value)
+                    self.user = self.db.login(email.value or "", password.value or "")
                 self.show_main()
+            except ConfirmEmail:
+                self.toast("تم إنشاء الحساب! افتح بريدك الإلكتروني لتفعيله ثم سجّل الدخول")
+                self.show_auth(register=False)
             except DatabaseError as err:
                 self.toast(str(err), error=True)
 
@@ -120,6 +129,7 @@ class SocialApp:
                             "أنشئ حساباً جديداً" if register else "سجّل دخولك وشارك أفكارك",
                             color=ft.Colors.ON_SURFACE_VARIANT,
                         ),
+                        email,
                         username,
                         full_name,
                         password,
@@ -146,6 +156,7 @@ class SocialApp:
         )
 
     def logout(self, e=None):
+        self.db.logout()
         self.user = None
         self.tab = 0
         self.show_auth()
@@ -202,13 +213,13 @@ class SocialApp:
         is_mine = post["user_id"] == self.user["id"]
 
         def like(e):
-            self.db.toggle_like(self.user["id"], post["id"])
+            self.db.toggle_like(post["id"])
             self.refresh()
 
         def delete(e):
             def confirm(ev):
                 self.page.pop_dialog()
-                self.db.delete_post(self.user["id"], post["id"])
+                self.db.delete_post(post["id"])
                 self.toast("تم حذف المنشور")
                 self.refresh()
 
@@ -293,7 +304,7 @@ class SocialApp:
 
         def publish(e):
             try:
-                self.db.create_post(self.user["id"], field.value or "")
+                self.db.create_post(field.value or "")
                 self.toast("تم النشر بنجاح")
                 self.refresh()
             except DatabaseError as err:
@@ -319,7 +330,7 @@ class SocialApp:
             self.composer(),
             ft.Text("آخر المنشورات", size=20, weight=ft.FontWeight.BOLD),
             self.posts_column(
-                self.db.feed(self.user["id"]),
+                self.db.feed(),
                 "لا توجد منشورات بعد.\nانشر شيئاً أو تابع أشخاصاً من صفحة الاستكشاف!",
             ),
         )
@@ -356,7 +367,7 @@ class SocialApp:
             search_field,
             results,
             ft.Text("كل المنشورات", size=20, weight=ft.FontWeight.BOLD),
-            self.posts_column(self.db.all_posts(self.user["id"]), "لا توجد منشورات على الموقع بعد."),
+            self.posts_column(self.db.all_posts(), "لا توجد منشورات على الموقع بعد."),
         )
 
     def show_profile(self, user_id):
@@ -378,13 +389,13 @@ class SocialApp:
             )
 
         def follow(e):
-            self.db.toggle_follow(self.user["id"], user_id)
+            self.db.toggle_follow(user_id)
             self.show_profile(user_id)
 
         if is_me:
             action = ft.OutlinedButton("تعديل الملف الشخصي", icon=ft.Icons.EDIT, on_click=lambda e: self.edit_profile())
         else:
-            following = self.db.is_following(self.user["id"], user_id)
+            following = user["is_following"]
             action = (
                 ft.OutlinedButton("إلغاء المتابعة", icon=ft.Icons.PERSON_REMOVE, on_click=follow)
                 if following
@@ -418,7 +429,7 @@ class SocialApp:
         if is_me:
             controls.append(self.composer())
         controls.append(
-            self.posts_column(self.db.user_posts(self.user["id"], user_id), "لا توجد منشورات بعد.")
+            self.posts_column(self.db.user_posts(user_id), "لا توجد منشورات بعد.")
         )
         self.set_body(*controls)
 
@@ -430,7 +441,7 @@ class SocialApp:
 
         def save(e):
             try:
-                self.db.update_profile(self.user["id"], name.value or "", bio.value or "")
+                self.db.update_profile(name.value or "", bio.value or "")
                 self.page.pop_dialog()
                 self.toast("تم حفظ التعديلات")
                 self.show_profile(self.user["id"])
@@ -482,7 +493,7 @@ class SocialApp:
 
         def send(e):
             try:
-                self.db.add_comment(self.user["id"], post["id"], field.value or "")
+                self.db.add_comment(post["id"], field.value or "")
                 field.value = ""
                 load()
                 self.page.update()
@@ -508,7 +519,11 @@ class SocialApp:
 
 
 def main(page: ft.Page):
-    SocialApp(page)
+    try:
+        SocialApp(page)
+    except RuntimeError as err:
+        page.rtl = True
+        page.add(ft.Text(str(err), color=ft.Colors.RED, size=18))
 
 
 if __name__ == "__main__":
